@@ -2498,7 +2498,7 @@ struct Rule {
     Mode mode_;
     std::string code_;
 
-    mutable std::auto_ptr<Expression> regex_;
+    mutable std::unique_ptr<Expression> regex_;
 
     Rule(unsigned weight, Mode mode, const std::string &code) :
         weight_(weight),
@@ -2849,6 +2849,8 @@ Bundle Sign(const std::string &root, Folder &folder, const std::string &key, con
 #endif
 }
 
+#define LDID_NOTOOLS
+
 #ifndef LDID_NOTOOLS
 int main(int argc, char *argv[]) {
 #ifndef LDID_NOSMIME
@@ -3183,3 +3185,114 @@ int main(int argc, char *argv[]) {
     return filee;
 }
 #endif
+
+namespace ldid {
+	// Based heavily on ldid::Sign executable locating logic.
+	std::string ExecutablePath(std::string bundlePath)
+	{
+		auto folder = ldid::DiskFolder(bundlePath);
+
+		std::string executable;
+
+		bool mac(false);
+
+		std::string info("Info.plist");
+		if (!folder.Look(info) && folder.Look("Resources/" + info)) {
+			mac = true;
+			info = "Resources/" + info;
+		}
+
+		folder.Open(info, fun([&](std::streambuf& buffer, size_t length, const void* flag) {
+			// printf("111\n");
+			plist_d(buffer, length, fun([&](plist_t node) {
+				executable = plist_s(plist_dict_get_item(node, "CFBundleExecutable"));
+				}));
+			}));
+
+		if (!mac && folder.Look("MacOS/" + executable)) {
+			executable = "MacOS/" + executable;
+			mac = true;
+		}
+
+		// std::cout << "executable: "<< executable << std::endl;
+
+		return executable;
+	}
+
+	// Based heavily on ldid's -e argument logic.
+	std::string Entitlements(std::string path)
+	{
+		struct stat info;
+		_syscall(stat(path.c_str(), &info));
+
+		if (S_ISDIR(info.st_mode))
+		{
+			path += "/" + ExecutablePath(path);
+		}
+
+		std::stringstream stringstream;
+
+		// std::cout << "entpath: " << path << std::endl;
+		Map mapping(path, false);
+		// std::cout << 0 << std::endl;
+		FatHeader fat_header(mapping.data(), mapping.size());
+		// std::cout << 1 << std::endl;
+
+		_foreach(mach_header, fat_header.GetMachHeaders())
+		{
+		// std::cout << 2 << std::endl;
+
+			struct linkedit_data_command* signature(NULL);
+
+			_foreach(load_command, mach_header.GetLoadCommands())
+			{
+				uint32_t cmd(mach_header.Swap(load_command->cmd));
+				if (cmd == LC_CODE_SIGNATURE)
+				{
+					signature = reinterpret_cast<struct linkedit_data_command*>(load_command);
+				}
+			}
+
+			if (signature != NULL)
+			{
+		// std::cout << 3 << std::endl;
+
+				uint32_t data = mach_header.Swap(signature->dataoff);
+
+				uint8_t* top = reinterpret_cast<uint8_t*>(mach_header.GetBase());
+				uint8_t* blob = top + data;
+				struct SuperBlob* super = reinterpret_cast<struct SuperBlob*>(blob);
+
+				for (size_t index(0); index != Swap(super->count); ++index)
+				{
+					if (Swap(super->index[index].type) == CSSLOT_ENTITLEMENTS)
+					{
+						uint32_t begin = Swap(super->index[index].offset);
+						struct Blob* entitlements = reinterpret_cast<struct Blob*>(blob + begin);
+
+						char* bytes = (char*)(entitlements + 1);
+						int size = Swap(entitlements->length) - sizeof(*entitlements);
+
+						for (int i = 0; i < size; i++)
+						{
+							char byte = bytes[i];
+							stringstream << byte;
+						}
+
+						if (size > 0)
+						{
+							auto entitlementsString = stringstream.str();
+
+							// One valid mach_header is all we need to retrieve entitlements, so return to stop iterating over the next ones.
+							return entitlementsString;
+						}
+					}
+				}
+			}
+		}
+
+		// No entitlements found in any mach_header, so return empty string.
+		return "";
+	}
+} // namespace ldid
+
